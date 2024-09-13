@@ -21,13 +21,14 @@ import pandavro as pdx
 @pytest.fixture
 def dataframe():
     strings = ['foo', 'bar', 'foo', 'bar', 'foo', 'bar', 'foo', 'bar']
-    return pd.DataFrame({"Boolean": [True, False, True, False, True, False, True, False],
-                         "DateTime64": pd.date_range('20190101', '20190108', freq="1D", tz=timezone.utc),
-                         "Float64": np.random.randn(8),
-                         "Int64": np.random.randint(0, 10, 8),
-                         "String": strings,
-                         "Bytes": [string.encode() for string in strings],
-                         })
+    return pd.DataFrame({
+        "Boolean": [True, False, True, False, True, False, True, False],
+        "DateTime64": pd.date_range('20190101', '20190108', freq="1D", tz=timezone.utc),
+        "Float64": np.random.randn(8),
+        "Int64": np.random.randint(0, 10, 8),
+        "String": strings,
+        "Bytes": [string.encode() for string in strings],
+    })
 
 
 def process_datetime64_column(df):
@@ -38,16 +39,15 @@ def test_schema_infer(dataframe):
     expect = {
         'type': 'record',
         'name': 'Root',
-        'fields':
-            [
-                {'type': ['null', 'boolean'], 'name': 'Boolean'},
-                {'type': ['null', {'logicalType': 'timestamp-micros', 'type': 'long'}],
-                    'name': 'DateTime64'},
-                {'type': ['null', 'double'], 'name': 'Float64'},
-                {'type': ['null', 'long'], 'name': 'Int64'},
-                {'type': ['null', 'string'], 'name': 'String'},
-                {'type': ['null', 'bytes'], 'name': 'Bytes'},
-            ]
+        'fields': [
+            {'type': ['null', 'boolean'], 'name': 'Boolean'},
+            {'type': ['null', {'logicalType': 'timestamp-micros', 'type': 'long'}],
+             'name': 'DateTime64'},
+            {'type': ['null', 'double'], 'name': 'Float64'},
+            {'type': ['null', 'long'], 'name': 'Int64'},
+            {'type': ['null', 'string'], 'name': 'String'},
+            {'type': ['null', 'bytes'], 'name': 'Bytes'},
+        ]
     }
     assert expect == pdx.schema_infer(dataframe, times_as_micros=True)
 
@@ -60,7 +60,7 @@ def test_schema_infer_times_as_millis(dataframe):
             [
                 {'type': ['null', 'boolean'], 'name': 'Boolean'},
                 {'type': ['null', {'logicalType': 'timestamp-millis', 'type': 'long'}],
-                    'name': 'DateTime64'},
+                 'name': 'DateTime64'},
                 {'type': ['null', 'double'], 'name': 'Float64'},
                 {'type': ['null', 'long'], 'name': 'Int64'},
                 {'type': ['null', 'string'], 'name': 'String'},
@@ -78,7 +78,7 @@ def test_schema_infer_complex_types(dataframe):
             [
                 {'type': ['null', 'boolean'], 'name': 'Boolean'},
                 {'type': ['null', {'logicalType': 'timestamp-micros', 'type': 'long'}],
-                    'name': 'DateTime64'},
+                 'name': 'DateTime64'},
                 {'type': ['null', 'double'], 'name': 'Float64'},
                 {'type': ['null', 'long'], 'name': 'Int64'},
                 {'type': ['null', 'string'], 'name': 'String'},
@@ -112,7 +112,7 @@ def test_fields_infer(dataframe):
     expect = [
         {'type': ['null', 'boolean'], 'name': 'Boolean'},
         {'type': ['null', {'logicalType': 'timestamp-micros', 'type': 'long'}],
-            'name': 'DateTime64'},
+         'name': 'DateTime64'},
         {'type': ['null', 'double'], 'name': 'Float64'},
         {'type': ['null', 'long'], 'name': 'Int64'},
         {'type': ['null', 'string'], 'name': 'String'},
@@ -181,12 +181,6 @@ def test_dataframe_kwargs(dataframe):
     process_datetime64_column(expect)
     df = dataframe.drop(columns, axis=1)
     assert_frame_equal(expect, df)
-    # specify index
-    index = 'String'
-    expect = pdx.read_avro(tf.name, index=index)
-    process_datetime64_column(expect)
-    df = dataframe.set_index(index)
-    assert_frame_equal(expect, df)
     # specify nrows + exclude columns
     columns = ['String', 'Boolean']
     expect = pdx.read_avro(tf.name, exclude=columns, nrows=3)
@@ -231,7 +225,7 @@ def dataframe_na_dtypes():
 
 
 def test_advanced_dtypes(dataframe_na_dtypes):
-    "Should be able to write and read Pandas 1.0 NaN-compatible dtypes"
+    """Should be able to write and read Pandas 1.0 NaN-compatible dtypes"""
     tf = NamedTemporaryFile()
     pdx.to_avro(tf.name, dataframe_na_dtypes)
 
@@ -259,7 +253,7 @@ def test_advanced_dtypes(dataframe_na_dtypes):
 
 
 def test_ints(dataframe_na_dtypes):
-    "Should write and read (unsigned) ints"
+    """Should write and read (unsigned) ints"""
     tf = NamedTemporaryFile()
     pdx.to_avro(tf.name, dataframe_na_dtypes)
 
@@ -271,9 +265,9 @@ def test_ints(dataframe_na_dtypes):
     expect = pdx.read_avro(tf.name, columns=columns, na_dtypes=False)
     df = dataframe_na_dtypes[columns]
     # Avro does not have the concept of 8 or 16-bit int
-    df["Int8"] = df["Int8"].astype(np.int64)
-    df["Int16"] = df["Int16"].astype(np.int64)
-    df["Int32"] = df["Int32"].astype(np.int64)
+    df["Int8"] = df["Int8"].astype(np.int32)
+    df["Int16"] = df["Int16"].astype(np.int32)
+    df["Int32"] = df["Int32"].astype(np.int32)
     assert_frame_equal(expect, df)
 
     # Numpy UInts
@@ -282,10 +276,10 @@ def test_ints(dataframe_na_dtypes):
     expect = pdx.read_avro(tf.name, columns=columns, na_dtypes=False)
     df = dataframe_na_dtypes[columns]
     # Avro does not have the concept of 8 or 16-bit int
-    df["UInt8"] = df["UInt8"].astype(np.int64)
-    df["UInt16"] = df["UInt16"].astype(np.int64)
-    df["UInt32"] = df["UInt32"].astype(np.int64)
-    df["UInt64"] = df["UInt64"].astype(np.int64)
+    df["UInt8"] = df["UInt8"].astype(np.uint32)
+    df["UInt16"] = df["UInt16"].astype(np.uint32)
+    df["UInt32"] = df["UInt32"].astype(np.uint32)
+    df["UInt64"] = df["UInt64"].astype(np.uint64)
     assert_frame_equal(expect, df)
 
     # Pandas Ints

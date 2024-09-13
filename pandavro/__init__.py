@@ -1,14 +1,18 @@
+import json
 from collections import OrderedDict
+from datetime import datetime, date, time
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, Optional
+from typing import Any, Dict, Generator, Iterable, Optional, Union
 
 import fastavro
 import numpy as np
 import pandas as pd
+from numpy import dtype
 from pandas import DatetimeTZDtype
 
 NUMPY_TO_AVRO_TYPES = {
     np.dtype('?'): 'boolean',
+    np.bool_: 'boolean',
     # pd.[U]Int[6/16/32/64]Dtype() is covered by these numpy types
     np.int8: 'int',
     np.int16: 'int',
@@ -20,39 +24,69 @@ NUMPY_TO_AVRO_TYPES = {
     np.uint64: {'type': 'long', 'unsigned': True},
     np.dtype('O'): 'complex',  # FIXME: Don't automatically store objects as strings
     np.unicode_: 'string',
+    np.str_: 'string',
+    np.string_: 'string',
+    str: 'string',
     np.float32: 'float',
     np.float64: 'double',
     np.datetime64: {'type': 'long', 'logicalType': 'timestamp-micros'},
     DatetimeTZDtype: {'type': 'long', 'logicalType': 'timestamp-micros'},
     pd.Timestamp: {'type': 'long', 'logicalType': 'timestamp-micros'},
+    np.NaN: 'null',
+}
+
+AVRO_TO_NUMPY_TYPES = {
+    'long': np.int64,
+    'int': np.int32,
+    'string': np.dtype('O'),
+    'null': np.dtype('O'),
+    'boolean': np.dtype('?'),
+    'float': np.float32,
+    'double': np.float64,
+    'bytes': np.dtype('O'),
+    'record': np.dtype('O'),
+    'enum': np.dtype('O'),
+    'array': np.array,
+    'map': np.dtype('O'),
+    'fixed': np.dtype('O'),
+    'complex': np.dtype('O'),
+}
+
+NUMPY_TO_PANDAS_TYPES_TO_CASTING = {
+    pd.Int32Dtype,
+    pd.Int32Dtype,
+    pd.Int32Dtype,
+    pd.Int64Dtype,
+    pd.UInt32Dtype,
+    pd.UInt32Dtype,
+    pd.UInt32Dtype,
+    pd.UInt64Dtype,
+    pd.StringDtype,
+    pd.BooleanDtype,
 }
 
 # This is used for forced conversion to Pandas NA-dtypes
-AVRO_TO_PANDAS_TYPES = {}
-# We use this extra dict for unsigned ints, adding it allows the dicts to stay a nice simple mapping
-AVRO_TO_PANDAS_UNSIGNED_TYPES = {}
-
-# This is used to convert Pandas NA-dtypes to python so fastavro can write
-PANDAS_TO_PYTHON_TYPES = {}
-
 # Pandas 0.24 added support for nullable integers. Include those in the supported
 # integer dtypes if present, otherwise ignore them.
+AVRO_TO_PANDAS_TYPES = {
+    'int': pd.Int32Dtype,
+    'long': pd.Int64Dtype,
+    'string': pd.StringDtype,
+    'boolean': pd.BooleanDtype,
+}
 
-# Int8 and Int16 don't exist in Pandas NA-dtypes
-AVRO_TO_PANDAS_TYPES['int'] = pd.Int32Dtype
-AVRO_TO_PANDAS_TYPES['long'] = pd.Int64Dtype
-AVRO_TO_PANDAS_UNSIGNED_TYPES['int'] = pd.UInt32Dtype
+# We use this extra dict for unsigned ints, adding it allows the dicts to stay a nice simple mapping
+AVRO_TO_NUMPY_UNSIGNED_TYPES = {
+    'int': np.uint32,
+    'long': np.uint64,
+}
+AVRO_TO_PANDAS_UNSIGNED_TYPES = {
+    'int': pd.UInt32Dtype,
+    'long': pd.UInt64Dtype,
+}
 
-# Recognize these Pandas dtypes
-NUMPY_TO_AVRO_TYPES[pd.StringDtype()] = 'string'
-NUMPY_TO_AVRO_TYPES[pd.BooleanDtype()] = 'boolean'
-
-# Convert these to python first
-PANDAS_TO_PYTHON_TYPES[np.bool_] = bool
-
-# Indicate the optional return datatype
-AVRO_TO_PANDAS_TYPES['string'] = pd.StringDtype
-AVRO_TO_PANDAS_TYPES['boolean'] = pd.BooleanDtype
+# This is used to convert Pandas NA-dtypes to python so fastavro can write
+PANDAS_TO_PYTHON_TYPES = {np.bool_: bool}
 
 
 def __type_infer(t):
@@ -81,6 +115,7 @@ def __complex_field_infer(df, field, nested_record_names):
     bool_types = {bool, NoneType}
     string_types = {str, NoneType}
     byte_types = {bytes, NoneType}
+    datetime_types = {datetime, date, time, NoneType}
     record_types = {dict, OrderedDict, NoneType}
     array_types = {list, NoneType}
 
@@ -89,15 +124,26 @@ def __complex_field_infer(df, field, nested_record_names):
     # String type - have to check for string first, in case a column contains
     # entirely 'None's
     if base_field_types.issubset(string_types):
-        return 'string'
+        return ['null', 'string']
     # Bool type - if a boolean field contains missing values, pandas will give
-    # its type as np.dtype('O'), so we have to double check for it here.
+    # its type as np.dtype('O'), so we have to double-check for it here.
     if base_field_types.issubset(bool_types):
-        return 'boolean'
+        return ['null', 'boolean']
+
+    # Date type
+    if base_field_types.issubset(datetime_types):
+        return [
+            'null',
+            {
+                "type": "int",
+                "logicalType": "date"
+            }
+        ]
+
     # Bytes type - have to check for bytes first, in case a column contains
     # entirely 'None's
     if base_field_types.issubset(byte_types):
-        return 'bytes'
+        return ['null', 'bytes']
     # Record type
     elif base_field_types.issubset(record_types):
         records = df.loc[~df[field].isna(), field].reset_index(drop=True)
@@ -106,12 +152,15 @@ def __complex_field_infer(df, field, nested_record_names):
             nested_record_names[field] += 1
         else:
             nested_record_names[field] = 0
-        return {
-            'type': 'record',
-            'name': field + '_record' + str(nested_record_names[field]),
-            'fields': __fields_infer(pd.DataFrame.from_records(records),
-                                     nested_record_names)
-        }
+        return [
+            'null',
+            {
+                'type': 'record',
+                'name': field + '_record' + str(nested_record_names[field]),
+                'fields': __fields_infer(pd.DataFrame.from_records(records),
+                                         nested_record_names)
+            }
+        ]
     # Array type
     elif base_field_types.issubset(array_types):
         arrays = pd.Series(df.loc[~df[field].isna(), field].sum(),
@@ -124,10 +173,15 @@ def __complex_field_infer(df, field, nested_record_names):
         else:
             items = __fields_infer(arrays.to_frame(),
                                    nested_record_names)[0]['type']
-        return {
-            'type': 'array',
-            'items': items
-        }
+        return [
+            'null',
+            {
+                'type': 'array',
+                'items': items
+            }
+        ]
+
+    return 'null'
 
 
 def __fields_infer(df, nested_record_names):
@@ -137,10 +191,7 @@ def __fields_infer(df, nested_record_names):
     ]
     for field in inferred_fields:
         if 'complex' in field['type']:
-            field['type'] = [
-                'null',
-                __complex_field_infer(df, field['name'], nested_record_names)
-            ]
+            field['type'] = __complex_field_infer(df, field['name'], nested_record_names)
     return inferred_fields
 
 
@@ -184,73 +235,111 @@ def schema_infer(df, times_as_micros=True):
     return schema
 
 
+def __map_avro_to_numpy_type(column_types: Union[list, str, dict], na_dtypes):
+    if type(column_types) == list:
+        column_types.remove('null')
+        if len(column_types) > 1:
+            return np.dtype('O')
+        return __map_avro_to_numpy_type(column_types[0], na_dtypes)
+
+    if type(column_types) == dict:
+        if column_types.get('type') == 'long' and column_types.get('logicalType') == 'timestamp-micros':
+            return datetime
+        elif column_types.get('type') == 'int' and column_types.get('logicalType') == 'date':
+            return date
+        elif column_types.get('type') in AVRO_TO_NUMPY_UNSIGNED_TYPES.keys() and column_types.get('unsigned') == True:
+            base_type = column_types.get('type')
+            if na_dtypes:
+                unsigned_dtype = AVRO_TO_PANDAS_UNSIGNED_TYPES.get(base_type)
+                if unsigned_dtype is not None:
+                    return unsigned_dtype
+            return AVRO_TO_NUMPY_UNSIGNED_TYPES.get(base_type) \
+                if base_type in AVRO_TO_NUMPY_UNSIGNED_TYPES \
+                else np.dtype('O')
+        else:
+            return __map_avro_to_numpy_type(column_types['type'], na_dtypes)
+
+    if type(column_types) == str:
+        if na_dtypes:
+            dtype = AVRO_TO_PANDAS_TYPES.get(column_types)
+            if dtype is not None:
+                return dtype
+        return AVRO_TO_NUMPY_TYPES.get(column_types) \
+            if column_types in AVRO_TO_NUMPY_TYPES \
+            else np.dtype('O')
+
+
+def __get_avro_meta(f, schema, na_dtypes=False):
+    reader = fastavro.reader(f, reader_schema=schema)
+
+    rows_count = 0
+    keys = None
+    avro_schema_fields = json.loads(reader.metadata['avro.schema'])['fields']
+
+    np_schema = {field['name']: __map_avro_to_numpy_type(field['type'], na_dtypes) for field in avro_schema_fields}
+
+    # Compute records count
+    for record in reader:
+        if keys is None:
+            keys = record.keys()
+        rows_count += 1
+
+    return {
+        'rows_count': rows_count,
+        'columns_count': len(keys),
+        'columns': keys,
+        'schema': [(key, np_schema[key]) for key in keys],
+        'schema_dict': np_schema,
+    }
+
+
 def __file_to_dataframe(
-    f,
-    schema,
-    na_dtypes=False,
-    columns: Optional[Iterable[str]] = None,
-    exclude: Optional[Iterable[str]] = None,
-    nrows: Optional[int] = None,
-    **kwargs,
+        f,
+        schema,
+        na_dtypes=False,
+        columns: Optional[Iterable[str]] = None,
+        exclude: Optional[Iterable[str]] = None,
+        nrows: Optional[int] = None,
+        **kwargs,
 ):
+    avro_meta = __get_avro_meta(f, schema, na_dtypes)
+    f.seek(0)
+
     reader = fastavro.reader(f, reader_schema=schema)
     columns_to_include = frozenset(columns) if columns else set()
     columns_to_exclude = frozenset(exclude) if exclude else set()
 
-    records = []
-    for row_idx, row in enumerate(reader):
+    # include if columns_to_include not defined OR column in columns_to_include
+    # AND
+    # remove if columns_to_exclude not defined OR column in columns_to_exclude
+    dataframe_columns = set(avro_meta['columns']) - columns_to_exclude
+    dataframe_columns = dataframe_columns & columns_to_include \
+        if len(columns_to_include) > 0 \
+        else dataframe_columns
 
+    columns = [col for col in avro_meta['columns'] if col in dataframe_columns]
+    columns_schema = [c for c in avro_meta['schema'] if c[0] in columns]
+
+    # read rows to numpy array
+    rows_count = nrows if nrows is not None else avro_meta['rows_count']
+    records = np.empty((rows_count,), dtype=columns_schema)
+    for row_idx, row in enumerate(reader):
         # stop if we reached nrows
         if nrows and row_idx == nrows:
             break
 
-        # include if columns_to_include not defined OR column in columns_to_include
-        # AND
-        # remove if columns_to_exclude not defined OR column in columns_to_exclude
-        records.append(
-            {
-                column: column_value
-                for column, column_value in row.items()
-                if len(columns_to_include) == 0 or column in columns_to_include
-                if len(columns_to_exclude) == 0 or column not in columns_to_exclude
-            }
-        )
+        records[row_idx] = tuple(row[col] for col in columns)
 
     # add columns again to indicate the order of the resulting dataframe
-    df = pd.DataFrame.from_records(records, columns=columns, **kwargs)
+    df = pd.DataFrame(data=records, columns=columns, **kwargs)
 
-    def _filter(typelist):
-        # It's a string, we return it directly
-        if type(typelist) == str:
-            return typelist, False
-        # If a logical type dict, it has a type attribute
-        elif type(typelist) == dict:
-            # Return None as we don't touch logical types
-            if typelist.get('logicalType'):
-                return None, False
-            elif typelist.get('unsigned'):
-                return typelist['type'], True
-        # It's a list and we filter any "null"
-        else:
-            l = [t for t in typelist if t != "null"]
-            if len(l) > 1:
-                raise ValueError("More items in Avro schema type list than 1: '{d}'".format(l))
-            return _filter(l[0])
-
+    # normalize dataframe pandas types
     if na_dtypes:
-        # Look at schema here, map Avro types to available Pandas 1.0 dtypes
-        # Then convert dtypes in place to these new dtypes in a deterministic way
-        # We know this is possible as we know the Avro type
-        for field in reader.writer_schema["fields"]:
-            t, u = _filter(field["type"])
-            name = field["name"]
-            if name in df.columns:
-                if not u:
-                    if t in AVRO_TO_PANDAS_TYPES:
-                        df[name] = df[name].astype(AVRO_TO_PANDAS_TYPES[t]())
-                else:
-                    if t in AVRO_TO_PANDAS_UNSIGNED_TYPES:
-                        df[name] = df[name].astype(AVRO_TO_PANDAS_UNSIGNED_TYPES[t]())
+        for name, dtype in df.dtypes.items():
+            target_type = avro_meta['schema_dict'].get(name)
+            if dtype == 'object' and target_type in NUMPY_TO_PANDAS_TYPES_TO_CASTING:
+                df[name] = df[name].astype(target_type())
+
     return df
 
 
@@ -301,9 +390,10 @@ def from_avro(file_path_or_buffer, schema=None, na_dtypes=False, **kwargs):
 
 
 def __to_fastavro_records(df: pd.DataFrame) -> Generator[Dict[str, Any], None, None]:
-    "Converts a DataFrame to a fastavro record compatible iterable."
+    """Converts a DataFrame to a fastavro record compatible iterable."""
+
     def preprocess_dict(record: Dict[str, Any]) -> Dict[str, Any]:
-        "Preprocess a dict inplace for fastavro record compatibility."
+        """Preprocess a dict inplace for fastavro record compatibility."""
         for k, v in record.items():
             # Replace pd.NA with None so fastavro can write it
             if v is pd.NA:
